@@ -19,6 +19,7 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
 ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
 fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
 
@@ -105,13 +106,26 @@ CREATE TABLE IF NOT EXISTS nat_logs_2026_10 PARTITION OF nat_logs
 CREATE TABLE IF NOT EXISTS auditoria_consultas (
   id BIGSERIAL PRIMARY KEY,
   tenant_id UUID NOT NULL REFERENCES tenants(id),
-  usuario_id UUID NOT NULL REFERENCES usuarios(id),
+  usuario_id UUID REFERENCES usuarios(id),
+  solicitante TEXT,
   ip_pesquisado INET,
   porta_pesquisada INTEGER,
   ts_pesquisado TIMESTAMPTZ,
   resultado_encontrado BOOLEAN,
   executado_em TIMESTAMPTZ DEFAULT now()
 );
+
+DO $$
+BEGIN
+  ALTER TABLE auditoria_consultas ALTER COLUMN usuario_id DROP NOT NULL;
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  ALTER TABLE auditoria_consultas ADD COLUMN IF NOT EXISTS solicitante TEXT;
+EXCEPTION WHEN others THEN NULL;
+END $$;
 """
 
 SEED_SQL = """
@@ -175,6 +189,17 @@ async def validar_roteador(token: str) -> dict:
 
 async def get_roteador(x_router_token: str = Header(..., alias="X-Router-Token")) -> dict:
     return await validar_roteador(x_router_token)
+
+
+async def exigir_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
+    """
+    Protecao provisoria enquanto nao existe login de usuario por tenant
+    (isso sera substituido pelo sistema de autenticacao do painel web).
+    """
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY nao configurada no servidor")
+    if x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Chave de administrador invalida")
 
 
 @app.get("/health")
@@ -374,4 +399,112 @@ async def status_drive(tenant_id: str):
         "espaco_local_limite_gb": row["espaco_local_limite_gb"],
         "prazo_retencao_dias": row["prazo_retencao_dias"],
         "atualizado_em": row["atualizado_em"].isoformat() if row["atualizado_em"] else None,
+    }
+
+
+@app.get("/v1/tenants/{tenant_id}/search")
+async def buscar_log(
+    tenant_id: str,
+    ip_publico: str = Query(..., description="IP publico informado na ordem judicial"),
+    porta_publica: int = Query(..., description="Porta publica informada na ordem judicial"),
+    timestamp: datetime = Query(..., description="Data/hora do fato, formato ISO 8601 (ex: 2026-08-20T14:30:00Z)"),
+    solicitante: Optional[str] = Query(None, description="Identificacao de quem esta consultando (ex: numero do processo, nome do operador)"),
+    _admin: None = Depends(exigir_admin),
+):
+    """
+    Busca central do sistema: dado IP publico + porta + horario (dados
+    tipicamente presentes em uma ordem judicial), retorna qual IP privado
+    estava usando aquele IP:porta naquele momento, permitindo o cruzamento
+    posterior com o sistema de gerencia de clientes (IXC, RBX, etc).
+
+    A busca considera registros com ts_inicio <= timestamp, priorizando
+    aqueles cujo ts_fim (se existir) tambem cobre o timestamp pesquisado.
+    Funciona tanto para registros ainda locais quanto ja arquivados no
+    Drive -- o indice no Postgres nunca e apagado, so o arquivo bruto muda
+    de lugar.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                nl.id, nl.ip_publico, nl.porta_publica, nl.ip_privado, nl.porta_privada,
+                nl.protocolo, nl.ts_inicio, nl.ts_fim, nl.status, nl.arquivo_drive,
+                r.nome AS roteador_nome, r.identificador AS roteador_identificador
+            FROM nat_logs nl
+            JOIN roteadores r ON r.id = nl.roteador_id
+            WHERE nl.tenant_id = $1
+              AND nl.ip_publico = $2
+              AND nl.porta_publica = $3
+              AND nl.ts_inicio <= $4
+              AND (nl.ts_fim IS NULL OR nl.ts_fim >= $4)
+            ORDER BY nl.ts_inicio DESC
+            LIMIT 20
+            """,
+            tenant_id,
+            ip_publico,
+            porta_publica,
+            timestamp,
+        )
+
+        if not rows:
+            # Fallback: nenhum registro cobre exatamente o timestamp (ts_fim pode
+            # nao ter sido preenchido pelo roteador) -- pega o mais proximo antes dele.
+            rows = await conn.fetch(
+                """
+                SELECT
+                    nl.id, nl.ip_publico, nl.porta_publica, nl.ip_privado, nl.porta_privada,
+                    nl.protocolo, nl.ts_inicio, nl.ts_fim, nl.status, nl.arquivo_drive,
+                    r.nome AS roteador_nome, r.identificador AS roteador_identificador
+                FROM nat_logs nl
+                JOIN roteadores r ON r.id = nl.roteador_id
+                WHERE nl.tenant_id = $1
+                  AND nl.ip_publico = $2
+                  AND nl.porta_publica = $3
+                  AND nl.ts_inicio <= $4
+                ORDER BY nl.ts_inicio DESC
+                LIMIT 5
+                """,
+                tenant_id,
+                ip_publico,
+                porta_publica,
+                timestamp,
+            )
+
+        await conn.execute(
+            """
+            INSERT INTO auditoria_consultas
+                (tenant_id, solicitante, ip_pesquisado, porta_pesquisada, ts_pesquisado, resultado_encontrado)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            tenant_id,
+            solicitante,
+            ip_publico,
+            porta_publica,
+            timestamp,
+            len(rows) > 0,
+        )
+
+    resultados = [
+        {
+            "ip_privado": str(r["ip_privado"]),
+            "porta_privada": r["porta_privada"],
+            "protocolo": r["protocolo"],
+            "ts_inicio": r["ts_inicio"].isoformat(),
+            "ts_fim": r["ts_fim"].isoformat() if r["ts_fim"] else None,
+            "roteador": r["roteador_nome"],
+            "roteador_identificador": r["roteador_identificador"],
+            "status_armazenamento": r["status"],
+            "arquivo_drive": r["arquivo_drive"],
+        }
+        for r in rows
+    ]
+
+    return {
+        "encontrado": len(resultados) > 0,
+        "consulta": {
+            "ip_publico": ip_publico,
+            "porta_publica": porta_publica,
+            "timestamp": timestamp.isoformat(),
+        },
+        "resultados": resultados,
     }
