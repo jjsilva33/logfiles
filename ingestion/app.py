@@ -7,9 +7,11 @@ from typing import Optional
 
 import asyncpg
 import httpx
+import jwt
+import bcrypt
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Header, HTTPException, Depends, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel, IPvAnyAddress
 
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,9 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
 ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 12
 
 fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
 
@@ -177,11 +182,18 @@ class TenantCreate(BaseModel):
     plano: Optional[str] = "basico"
     espaco_local_limite_gb: Optional[int] = 50
     prazo_retencao_dias: Optional[int] = 365
+    admin_email: Optional[str] = None
+    admin_senha: Optional[str] = None
 
 
 class RoteadorCreate(BaseModel):
     nome: str
     identificador: str  # hostname/IP de gerencia do roteador
+
+
+class LoginRequest(BaseModel):
+    email: str
+    senha: str
 
 
 async def validar_roteador(token: str) -> dict:
@@ -208,8 +220,8 @@ async def get_roteador(x_router_token: str = Header(..., alias="X-Router-Token")
 
 async def exigir_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     """
-    Protecao provisoria enquanto nao existe login de usuario por tenant
-    (isso sera substituido pelo sistema de autenticacao do painel web).
+    Protecao de nivel plataforma (voce, o dono do SaaS) -- usada para criar
+    tenants novos. Os operadores dos ISPs usam login proprio (JWT), nao essa chave.
     """
     if not ADMIN_API_KEY:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY nao configurada no servidor")
@@ -217,9 +229,62 @@ async def exigir_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
         raise HTTPException(status_code=401, detail="Chave de administrador invalida")
 
 
+def hash_senha(senha: str) -> str:
+    return bcrypt.hashpw(senha.encode(), bcrypt.gensalt()).decode()
+
+
+def verificar_senha(senha: str, hash_: str) -> bool:
+    return bcrypt.checkpw(senha.encode(), hash_.encode())
+
+
+def gerar_jwt(usuario_id: str, tenant_id: str, papel: str) -> str:
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET nao configurada no servidor")
+    payload = {
+        "usuario_id": usuario_id,
+        "tenant_id": tenant_id,
+        "papel": papel,
+        "exp": datetime.now(timezone.utc).timestamp() + JWT_EXPIRATION_HOURS * 3600,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+async def exigir_acesso_tenant(tenant_id: str, authorization: Optional[str] = Header(None)):
+    """
+    Autoriza acesso a um recurso de um tenant especifico. Aceita um JWT de
+    usuario logado (Authorization: Bearer ...) cujo tenant_id bata com o da
+    URL. O admin da plataforma usa exigir_admin separadamente nas rotas de
+    gestao geral, nao nesta dependencia.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token de autenticacao ausente")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET nao configurada no servidor")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Sessao expirada, faca login novamente")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token invalido")
+
+    if payload["tenant_id"] != tenant_id:
+        raise HTTPException(status_code=403, detail="Acesso negado a este tenant")
+
+    return payload
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/painel", response_class=HTMLResponse)
+async def painel():
+    """Serve o painel web (login + busca + gestao de roteadores)."""
+    caminho = os.path.join(os.path.dirname(__file__), "static", "painel.html")
+    with open(caminho, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 @app.post("/v1/logs")
@@ -417,14 +482,44 @@ async def status_drive(tenant_id: str):
     }
 
 
+@app.post("/v1/auth/login")
+async def login(dados: LoginRequest):
+    """Login do operador do ISP. Retorna um JWT valido por 12h."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, tenant_id, senha_hash, papel FROM usuarios WHERE email = $1",
+            dados.email,
+        )
+
+    if not rows:
+        raise HTTPException(status_code=401, detail="Email ou senha invalidos")
+
+    usuario = None
+    for r in rows:
+        if verificar_senha(dados.senha, r["senha_hash"]):
+            usuario = r
+            break
+
+    if usuario is None:
+        raise HTTPException(status_code=401, detail="Email ou senha invalidos")
+
+    token = gerar_jwt(str(usuario["id"]), str(usuario["tenant_id"]), usuario["papel"])
+
+    return {
+        "token": token,
+        "tenant_id": str(usuario["tenant_id"]),
+        "papel": usuario["papel"],
+    }
+
+
 @app.get("/v1/tenants/{tenant_id}/search")
 async def buscar_log(
     tenant_id: str,
     ip_publico: str = Query(..., description="IP publico informado na ordem judicial"),
     porta_publica: int = Query(..., description="Porta publica informada na ordem judicial"),
     timestamp: datetime = Query(..., description="Data/hora do fato, formato ISO 8601 (ex: 2026-08-20T14:30:00Z)"),
-    solicitante: Optional[str] = Query(None, description="Identificacao de quem esta consultando (ex: numero do processo, nome do operador)"),
-    _admin: None = Depends(exigir_admin),
+    solicitante: Optional[str] = Query(None, description="Identificacao de quem esta consultando"),
+    sessao: dict = Depends(exigir_acesso_tenant),
 ):
     """
     Busca central do sistema: dado IP publico + porta + horario (dados
@@ -527,7 +622,7 @@ async def buscar_log(
 
 @app.post("/v1/tenants")
 async def criar_tenant(dados: TenantCreate, _admin: None = Depends(exigir_admin)):
-    """Cadastra um novo ISP cliente do SaaS."""
+    """Cadastra um novo ISP cliente do SaaS, com um usuario admin opcional."""
     tenant_id = str(uuid.uuid4())
 
     async with pool.acquire() as conn:
@@ -552,13 +647,32 @@ async def criar_tenant(dados: TenantCreate, _admin: None = Depends(exigir_admin)
                 dados.prazo_retencao_dias,
             )
 
+            usuario_criado = None
+            if dados.admin_email and dados.admin_senha:
+                usuario_id = str(uuid.uuid4())
+                senha_hash = hash_senha(dados.admin_senha)
+                await conn.execute(
+                    """
+                    INSERT INTO usuarios (id, tenant_id, email, senha_hash, papel)
+                    VALUES ($1, $2, $3, $4, 'admin')
+                    """,
+                    usuario_id,
+                    tenant_id,
+                    dados.admin_email,
+                    senha_hash,
+                )
+                usuario_criado = {"usuario_id": usuario_id, "email": dados.admin_email}
+
     log.info(f"Tenant criado: {tenant_id} ({dados.nome})")
 
     return {
         "tenant_id": tenant_id,
         "nome": dados.nome,
+        "usuario_admin": usuario_criado,
         "link_conexao_drive": f"/v1/tenants/{tenant_id}/drive/connect",
-        "mensagem": "Tenant criado. Envie o link_conexao_drive para o cliente autorizar o Google Drive dele.",
+        "link_painel": f"/painel",
+        "mensagem": "Tenant criado. Envie o link_conexao_drive para o cliente autorizar o Google Drive, "
+                    "e o link_painel + credenciais do usuario_admin para ele acessar o sistema.",
     }
 
 
@@ -592,7 +706,7 @@ async def listar_tenants(_admin: None = Depends(exigir_admin)):
 
 
 @app.post("/v1/tenants/{tenant_id}/roteadores")
-async def criar_roteador(tenant_id: str, dados: RoteadorCreate, _admin: None = Depends(exigir_admin)):
+async def criar_roteador(tenant_id: str, dados: RoteadorCreate, sessao: dict = Depends(exigir_acesso_tenant)):
     """
     Cadastra um roteador para um tenant e gera o token de ingestao que
     devera ser configurado no proprio roteador (ou no agente que envia
@@ -630,7 +744,7 @@ async def criar_roteador(tenant_id: str, dados: RoteadorCreate, _admin: None = D
 
 
 @app.get("/v1/tenants/{tenant_id}/roteadores")
-async def listar_roteadores(tenant_id: str, _admin: None = Depends(exigir_admin)):
+async def listar_roteadores(tenant_id: str, sessao: dict = Depends(exigir_acesso_tenant)):
     """Lista os roteadores de um tenant (sem expor o token novamente)."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(

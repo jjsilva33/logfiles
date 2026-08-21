@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inocmon - Painel</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1115;
+    color: #e6e8eb;
+    margin: 0;
+    min-height: 100vh;
+  }
+  .container { max-width: 900px; margin: 0 auto; padding: 24px; }
+  .card {
+    background: #171a21;
+    border: 1px solid #262b36;
+    border-radius: 10px;
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; color: #9aa4b2; margin: 0 0 16px; font-weight: 500; }
+  label { display: block; font-size: 13px; color: #9aa4b2; margin-bottom: 6px; margin-top: 14px; }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid #2c3240;
+    background: #0f1115; color: #e6e8eb; font-size: 14px;
+  }
+  input:focus { outline: none; border-color: #4f8cff; }
+  button {
+    background: #4f8cff; color: white; border: none; border-radius: 6px;
+    padding: 10px 18px; font-size: 14px; cursor: pointer; margin-top: 18px;
+  }
+  button:hover { background: #3d76e0; }
+  button.secondary { background: #262b36; }
+  button.secondary:hover { background: #333a49; }
+  .error { color: #ff6b6b; font-size: 13px; margin-top: 10px; }
+  .success { color: #4ade80; font-size: 13px; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #262b36; }
+  th { color: #9aa4b2; font-weight: 500; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .badge.local { background: #3d3115; color: #f0c33d; }
+  .badge.drive { background: #15351f; color: #4ade80; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  .hidden { display: none; }
+  .muted { color: #6b7280; font-size: 12px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  code { background: #0f1115; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- TELA DE LOGIN -->
+  <div id="tela-login" class="card" style="max-width: 380px; margin: 80px auto;">
+    <h1>Inocmon</h1>
+    <h2>Acesse o painel do seu provedor</h2>
+    <label>Email</label>
+    <input type="email" id="login-email" placeholder="seu@provedor.com.br">
+    <label>Senha</label>
+    <input type="password" id="login-senha" placeholder="••••••••">
+    <button onclick="fazerLogin()" style="width:100%">Entrar</button>
+    <div id="login-erro" class="error hidden"></div>
+  </div>
+
+  <!-- PAINEL PRINCIPAL -->
+  <div id="tela-painel" class="hidden">
+    <div class="topbar">
+      <div>
+        <h1>Inocmon</h1>
+        <div class="muted" id="tenant-info"></div>
+      </div>
+      <button class="secondary" onclick="logout()">Sair</button>
+    </div>
+
+    <!-- STATUS DO DRIVE -->
+    <div class="card">
+      <h2>Google Drive</h2>
+      <div id="drive-status" class="muted">Verificando...</div>
+      <button id="btn-conectar-drive" class="hidden" onclick="conectarDrive()">Conectar Google Drive</button>
+    </div>
+
+    <!-- BUSCA -->
+    <div class="card">
+      <h2>Buscar registro de conexão (para ordem judicial)</h2>
+      <div class="grid2">
+        <div>
+          <label>IP público</label>
+          <input type="text" id="busca-ip" placeholder="200.200.200.222">
+        </div>
+        <div>
+          <label>Porta pública</label>
+          <input type="number" id="busca-porta" placeholder="43211">
+        </div>
+      </div>
+      <label>Data e hora</label>
+      <input type="datetime-local" id="busca-timestamp">
+      <label>Solicitante / nº do processo (opcional)</label>
+      <input type="text" id="busca-solicitante" placeholder="Processo nº 0001234-56.2026...">
+      <button onclick="buscarLog()">Buscar</button>
+      <div id="busca-erro" class="error hidden"></div>
+      <div id="busca-resultado"></div>
+    </div>
+
+    <!-- ROTEADORES -->
+    <div class="card">
+      <h2>Roteadores cadastrados</h2>
+      <div id="lista-roteadores" class="muted">Carregando...</div>
+
+      <label style="margin-top:24px">Nome do novo roteador</label>
+      <input type="text" id="novo-roteador-nome" placeholder="Roteador Matriz">
+      <label>Identificador (IP de gerência)</label>
+      <input type="text" id="novo-roteador-id" placeholder="10.0.0.1">
+      <button onclick="criarRoteador()">Cadastrar roteador</button>
+      <div id="roteador-erro" class="error hidden"></div>
+      <div id="roteador-token" class="success hidden"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+let TOKEN = localStorage.getItem('inocmon_token');
+let TENANT_ID = localStorage.getItem('inocmon_tenant_id');
+
+function mostrarErro(elId, msg) {
+  const el = document.getElementById(elId);
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+function esconder(elId) {
+  document.getElementById(elId).classList.add('hidden');
+}
+
+async function fazerLogin() {
+  esconder('login-erro');
+  const email = document.getElementById('login-email').value;
+  const senha = document.getElementById('login-senha').value;
+
+  try {
+    const resp = await fetch(`${API}/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, senha })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      mostrarErro('login-erro', data.detail || 'Falha no login');
+      return;
+    }
+    TOKEN = data.token;
+    TENANT_ID = data.tenant_id;
+    localStorage.setItem('inocmon_token', TOKEN);
+    localStorage.setItem('inocmon_tenant_id', TENANT_ID);
+    mostrarPainel();
+  } catch (e) {
+    mostrarErro('login-erro', 'Erro de conexão com o servidor');
+  }
+}
+
+function logout() {
+  localStorage.removeItem('inocmon_token');
+  localStorage.removeItem('inocmon_tenant_id');
+  TOKEN = null;
+  TENANT_ID = null;
+  document.getElementById('tela-painel').classList.add('hidden');
+  document.getElementById('tela-login').classList.remove('hidden');
+}
+
+async function chamarApi(path, options = {}) {
+  const resp = await fetch(`${API}${path}`, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      'Authorization': `Bearer ${TOKEN}`,
+    }
+  });
+  if (resp.status === 401 || resp.status === 403) {
+    logout();
+    throw new Error('Sessão expirada');
+  }
+  return resp;
+}
+
+async function mostrarPainel() {
+  document.getElementById('tela-login').classList.add('hidden');
+  document.getElementById('tela-painel').classList.remove('hidden');
+  document.getElementById('tenant-info').textContent = `Tenant: ${TENANT_ID}`;
+  carregarStatusDrive();
+  carregarRoteadores();
+}
+
+async function carregarStatusDrive() {
+  try {
+    const resp = await fetch(`${API}/v1/tenants/${TENANT_ID}/drive/status`);
+    const data = await resp.json();
+    const statusEl = document.getElementById('drive-status');
+    const btnEl = document.getElementById('btn-conectar-drive');
+    if (data.conectado) {
+      statusEl.innerHTML = `✅ Conectado. Limite local: ${data.espaco_local_limite_gb}GB · Retenção: ${data.prazo_retencao_dias} dias`;
+      btnEl.classList.add('hidden');
+    } else {
+      statusEl.textContent = '⚠️ Google Drive ainda não conectado.';
+      btnEl.classList.remove('hidden');
+    }
+  } catch (e) {
+    document.getElementById('drive-status').textContent = 'Erro ao verificar status.';
+  }
+}
+
+function conectarDrive() {
+  window.open(`${API}/v1/tenants/${TENANT_ID}/drive/connect`, '_blank');
+}
+
+async function buscarLog() {
+  esconder('busca-erro');
+  document.getElementById('busca-resultado').innerHTML = '';
+
+  const ip = document.getElementById('busca-ip').value;
+  const porta = document.getElementById('busca-porta').value;
+  const ts = document.getElementById('busca-timestamp').value;
+  const solicitante = document.getElementById('busca-solicitante').value;
+
+  if (!ip || !porta || !ts) {
+    mostrarErro('busca-erro', 'Preencha IP, porta e data/hora.');
+    return;
+  }
+
+  const isoTs = new Date(ts).toISOString();
+  const params = new URLSearchParams({ ip_publico: ip, porta_publica: porta, timestamp: isoTs });
+  if (solicitante) params.append('solicitante', solicitante);
+
+  try {
+    const resp = await chamarApi(`/v1/tenants/${TENANT_ID}/search?${params}`);
+    const data = await resp.json();
+    if (!resp.ok) {
+      mostrarErro('busca-erro', data.detail || 'Erro na busca');
+      return;
+    }
+    renderizarResultadoBusca(data);
+  } catch (e) {
+    mostrarErro('busca-erro', e.message || 'Erro de conexão');
+  }
+}
+
+function renderizarResultadoBusca(data) {
+  const el = document.getElementById('busca-resultado');
+  if (!data.encontrado) {
+    el.innerHTML = `<p class="muted" style="margin-top:16px">Nenhum registro encontrado para essa consulta.</p>`;
+    return;
+  }
+  let html = '<table><thead><tr><th>IP privado</th><th>Roteador</th><th>Início</th><th>Fim</th><th>Armazenamento</th></tr></thead><tbody>';
+  for (const r of data.resultados) {
+    const badge = r.status_armazenamento === 'local'
+      ? '<span class="badge local">local</span>'
+      : `<span class="badge drive">Drive</span>`;
+    html += `<tr>
+      <td>${r.ip_privado}${r.porta_privada ? ':' + r.porta_privada : ''}</td>
+      <td>${r.roteador}</td>
+      <td>${new Date(r.ts_inicio).toLocaleString('pt-BR')}</td>
+      <td>${r.ts_fim ? new Date(r.ts_fim).toLocaleString('pt-BR') : '-'}</td>
+      <td>${badge}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+async function carregarRoteadores() {
+  const el = document.getElementById('lista-roteadores');
+  try {
+    const resp = await chamarApi(`/v1/tenants/${TENANT_ID}/roteadores`);
+    const data = await resp.json();
+    if (!data.length) {
+      el.innerHTML = '<p class="muted">Nenhum roteador cadastrado ainda.</p>';
+      return;
+    }
+    let html = '<table><thead><tr><th>Nome</th><th>Identificador</th><th>Status</th></tr></thead><tbody>';
+    for (const r of data) {
+      html += `<tr>
+        <td>${r.nome}</td>
+        <td><code>${r.identificador}</code></td>
+        <td>${r.ativo ? '🟢 ativo' : '🔴 inativo'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<p class="error">Erro ao carregar roteadores.</p>';
+  }
+}
+
+async function criarRoteador() {
+  esconder('roteador-erro');
+  esconder('roteador-token');
+
+  const nome = document.getElementById('novo-roteador-nome').value;
+  const identificador = document.getElementById('novo-roteador-id').value;
+
+  if (!nome || !identificador) {
+    mostrarErro('roteador-erro', 'Preencha nome e identificador.');
+    return;
+  }
+
+  try {
+    const resp = await chamarApi(`/v1/tenants/${TENANT_ID}/roteadores`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nome, identificador })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      mostrarErro('roteador-erro', data.detail || 'Erro ao criar roteador');
+      return;
+    }
+    const el = document.getElementById('roteador-token');
+    el.innerHTML = `Roteador criado! Token de ingestão (copie agora, não será mostrado de novo):<br><code>${data.token_ingestao}</code>`;
+    el.classList.remove('hidden');
+    document.getElementById('novo-roteador-nome').value = '';
+    document.getElementById('novo-roteador-id').value = '';
+    carregarRoteadores();
+  } catch (e) {
+    mostrarErro('roteador-erro', 'Erro de conexão');
+  }
+}
+
+// Bootstrap: se ja tem token salvo, tenta ir direto pro painel
+if (TOKEN && TENANT_ID) {
+  mostrarPainel();
+}
+</script>
+</body>
+</html>
