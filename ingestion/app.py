@@ -1,5 +1,7 @@
 import os
 import logging
+import secrets
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -167,6 +169,19 @@ class NatLogEvent(BaseModel):
     protocolo: Optional[str] = "tcp"
     ts_inicio: datetime
     ts_fim: Optional[datetime] = None
+
+
+class TenantCreate(BaseModel):
+    nome: str
+    cnpj: Optional[str] = None
+    plano: Optional[str] = "basico"
+    espaco_local_limite_gb: Optional[int] = 50
+    prazo_retencao_dias: Optional[int] = 365
+
+
+class RoteadorCreate(BaseModel):
+    nome: str
+    identificador: str  # hostname/IP de gerencia do roteador
 
 
 async def validar_roteador(token: str) -> dict:
@@ -508,3 +523,132 @@ async def buscar_log(
         },
         "resultados": resultados,
     }
+
+
+@app.post("/v1/tenants")
+async def criar_tenant(dados: TenantCreate, _admin: None = Depends(exigir_admin)):
+    """Cadastra um novo ISP cliente do SaaS."""
+    tenant_id = str(uuid.uuid4())
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO tenants (id, nome, cnpj, plano)
+                VALUES ($1, $2, $3, $4)
+                """,
+                tenant_id,
+                dados.nome,
+                dados.cnpj,
+                dados.plano,
+            )
+            await conn.execute(
+                """
+                INSERT INTO tenant_drive_config (tenant_id, espaco_local_limite_gb, prazo_retencao_dias)
+                VALUES ($1, $2, $3)
+                """,
+                tenant_id,
+                dados.espaco_local_limite_gb,
+                dados.prazo_retencao_dias,
+            )
+
+    log.info(f"Tenant criado: {tenant_id} ({dados.nome})")
+
+    return {
+        "tenant_id": tenant_id,
+        "nome": dados.nome,
+        "link_conexao_drive": f"/v1/tenants/{tenant_id}/drive/connect",
+        "mensagem": "Tenant criado. Envie o link_conexao_drive para o cliente autorizar o Google Drive dele.",
+    }
+
+
+@app.get("/v1/tenants")
+async def listar_tenants(_admin: None = Depends(exigir_admin)):
+    """Lista todos os tenants cadastrados, com status da conexao do Drive."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT t.id, t.nome, t.cnpj, t.status, t.plano, t.created_at,
+                   d.drive_folder_id IS NOT NULL AS drive_conectado,
+                   (SELECT count(*) FROM roteadores r WHERE r.tenant_id = t.id) AS total_roteadores
+            FROM tenants t
+            LEFT JOIN tenant_drive_config d ON d.tenant_id = t.id
+            ORDER BY t.created_at DESC
+            """
+        )
+    return [
+        {
+            "tenant_id": str(r["id"]),
+            "nome": r["nome"],
+            "cnpj": r["cnpj"],
+            "status": r["status"],
+            "plano": r["plano"],
+            "drive_conectado": r["drive_conectado"],
+            "total_roteadores": r["total_roteadores"],
+            "created_at": r["created_at"].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/v1/tenants/{tenant_id}/roteadores")
+async def criar_roteador(tenant_id: str, dados: RoteadorCreate, _admin: None = Depends(exigir_admin)):
+    """
+    Cadastra um roteador para um tenant e gera o token de ingestao que
+    devera ser configurado no proprio roteador (ou no agente que envia
+    os eventos de NAT para o endpoint /v1/logs).
+    """
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE id = $1", tenant_id)
+        if tenant is None:
+            raise HTTPException(status_code=404, detail="Tenant nao encontrado")
+
+        roteador_id = str(uuid.uuid4())
+        token = secrets.token_urlsafe(32)
+
+        await conn.execute(
+            """
+            INSERT INTO roteadores (id, tenant_id, nome, identificador, token_ingestao)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            roteador_id,
+            tenant_id,
+            dados.nome,
+            dados.identificador,
+            token,
+        )
+
+    log.info(f"Roteador criado: {roteador_id} (tenant {tenant_id})")
+
+    return {
+        "roteador_id": roteador_id,
+        "tenant_id": tenant_id,
+        "nome": dados.nome,
+        "token_ingestao": token,
+        "mensagem": "Configure este token no roteador/agente. Ele NAO sera mostrado novamente.",
+    }
+
+
+@app.get("/v1/tenants/{tenant_id}/roteadores")
+async def listar_roteadores(tenant_id: str, _admin: None = Depends(exigir_admin)):
+    """Lista os roteadores de um tenant (sem expor o token novamente)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, nome, identificador, ativo, created_at
+            FROM roteadores
+            WHERE tenant_id = $1
+            ORDER BY created_at DESC
+            """,
+            tenant_id,
+        )
+    return [
+        {
+            "roteador_id": str(r["id"]),
+            "nome": r["nome"],
+            "identificador": r["identificador"],
+            "ativo": r["ativo"],
+            "created_at": r["created_at"].isoformat(),
+        }
+        for r in rows
+    ]
