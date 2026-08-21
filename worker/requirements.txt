@@ -1,1 +1,2 @@
 asyncpg==0.29.0
+cryptography==43.0.1

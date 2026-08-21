@@ -4,13 +4,28 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
-from fastapi import FastAPI, Header, HTTPException, Depends
+import httpx
+from cryptography.fernet import Fernet
+from fastapi import FastAPI, Header, HTTPException, Depends, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, IPvAnyAddress
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("inocmon-ingestion")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+
+fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_DRIVE_API = "https://www.googleapis.com/drive/v3"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 app = FastAPI(title="Inocmon Ingestion Service")
 
@@ -229,3 +244,134 @@ async def receber_log_lote(eventos: list[NatLogEvent], roteador: dict = Depends(
             registros,
         )
     return {"status": "recebido", "gravados": len(registros)}
+
+
+@app.get("/v1/tenants/{tenant_id}/drive/connect")
+async def conectar_drive(tenant_id: str):
+    """
+    Gera a URL de autorizacao do Google para o tenant conectar a propria
+    conta do Drive. O admin do ISP acessa essa URL, loga com a conta Google
+    dele, e autoriza o Inocmon a criar/gerenciar arquivos numa pasta dedicada.
+    """
+    if not GOOGLE_CLIENT_ID or not OAUTH_REDIRECT_URI:
+        raise HTTPException(status_code=500, detail="OAuth do Google nao configurado no servidor")
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": DRIVE_SCOPE,
+        "access_type": "offline",   # necessario para receber refresh_token
+        "prompt": "consent",        # forca gerar refresh_token mesmo se ja autorizou antes
+        "state": tenant_id,
+    }
+    query = "&".join(f"{k}={httpx.QueryParams({k: v})[k]}" for k, v in params.items())
+    url = f"{GOOGLE_AUTH_URL}?{query}"
+    return RedirectResponse(url)
+
+
+@app.get("/v1/oauth/callback")
+async def oauth_callback(code: str = Query(...), state: str = Query(...)):
+    """
+    Google redireciona para ca apos o usuario autorizar. Trocamos o 'code'
+    por um refresh_token, criamos (ou reaproveitamos) uma pasta dedicada
+    no Drive do tenant, e salvamos tudo criptografado no banco.
+    """
+    tenant_id = state
+
+    if not fernet:
+        raise HTTPException(status_code=500, detail="ENCRYPTION_KEY nao configurada no servidor")
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": OAUTH_REDIRECT_URI,
+            },
+        )
+    if token_resp.status_code != 200:
+        log.error(f"Falha ao trocar code por token: {token_resp.text}")
+        raise HTTPException(status_code=400, detail="Falha na autorizacao com o Google")
+
+    tokens = token_resp.json()
+    refresh_token = tokens.get("refresh_token")
+    access_token = tokens["access_token"]
+
+    if not refresh_token:
+        # Acontece se o usuario ja tinha autorizado antes sem 'prompt=consent'.
+        raise HTTPException(
+            status_code=400,
+            detail="Google nao retornou refresh_token. Revogue o acesso em "
+                   "myaccount.google.com/permissions e tente conectar novamente.",
+        )
+
+    # Cria (ou localiza) a pasta dedicada "Inocmon Logs" no Drive do tenant
+    async with httpx.AsyncClient() as client:
+        search = await client.get(
+            f"{GOOGLE_DRIVE_API}/files",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={
+                "q": "name='Inocmon Logs' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                "fields": "files(id,name)",
+            },
+        )
+        existentes = search.json().get("files", [])
+
+        if existentes:
+            folder_id = existentes[0]["id"]
+        else:
+            criar = await client.post(
+                f"{GOOGLE_DRIVE_API}/files",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"name": "Inocmon Logs", "mimeType": "application/vnd.google-apps.folder"},
+            )
+            folder_id = criar.json()["id"]
+
+    refresh_token_criptografado = fernet.encrypt(refresh_token.encode()).decode()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO tenant_drive_config (tenant_id, drive_refresh_token, drive_folder_id, atualizado_em)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (tenant_id) DO UPDATE
+            SET drive_refresh_token = EXCLUDED.drive_refresh_token,
+                drive_folder_id = EXCLUDED.drive_folder_id,
+                atualizado_em = now()
+            """,
+            tenant_id,
+            refresh_token_criptografado,
+            folder_id,
+        )
+
+    log.info(f"Tenant {tenant_id}: Google Drive conectado com sucesso (pasta {folder_id})")
+    return {
+        "status": "conectado",
+        "tenant_id": tenant_id,
+        "drive_folder_id": folder_id,
+        "mensagem": "Google Drive conectado com sucesso. Pode fechar esta janela.",
+    }
+
+
+@app.get("/v1/tenants/{tenant_id}/drive/status")
+async def status_drive(tenant_id: str):
+    """Verifica se o tenant ja conectou o Google Drive."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT drive_folder_id, espaco_local_limite_gb, prazo_retencao_dias, atualizado_em "
+            "FROM tenant_drive_config WHERE tenant_id = $1",
+            tenant_id,
+        )
+    if row is None:
+        return {"conectado": False}
+    return {
+        "conectado": row["drive_folder_id"] is not None,
+        "drive_folder_id": row["drive_folder_id"],
+        "espaco_local_limite_gb": row["espaco_local_limite_gb"],
+        "prazo_retencao_dias": row["prazo_retencao_dias"],
+        "atualizado_em": row["atualizado_em"].isoformat() if row["atualizado_em"] else None,
+    }
