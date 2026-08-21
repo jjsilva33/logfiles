@@ -44,8 +44,27 @@ services:
       - "traefik.http.routers.inocmon-ingestion-http.middlewares=inocmon-redirect-https"
       - "traefik.http.middlewares.inocmon-redirect-https.redirectscheme.scheme=https"
 
+  worker:
+    build: ./worker
+    container_name: inocmon-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/inocmon_db
+      CHECK_INTERVAL_SECONDS: "900"
+      ARCHIVE_DIR: /var/inocmon/archive
+      RCLONE_REMOTE: gdrive
+    volumes:
+      - archive_logs:/var/inocmon/archive
+      - rclone_config:/root/.config/rclone
+    depends_on:
+      - postgres
+    networks:
+      - inocmon-internal
+
 volumes:
   pgdata:
+  archive_logs:
+  rclone_config:
 
 networks:
   inocmon-internal:
