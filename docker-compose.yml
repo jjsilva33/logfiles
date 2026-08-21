@@ -1,0 +1,54 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: inocmon-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: inocmon_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - inocmon-internal
+    # Sem 'traefik-public' aqui de proposito -- o banco NUNCA
+    # deve ficar acessivel pela rede publica/Traefik.
+
+  ingestion:
+    build: ./ingestion
+    container_name: inocmon-ingestion
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/inocmon_db
+    depends_on:
+      - postgres
+    networks:
+      - inocmon-internal
+      - portainer_default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=portainer_default"
+
+      # Roteamento HTTPS
+      - "traefik.http.routers.inocmon-ingestion.rule=Host(`${INGESTION_DOMAIN}`)"
+      - "traefik.http.routers.inocmon-ingestion.entrypoints=websecure"
+      - "traefik.http.routers.inocmon-ingestion.tls=true"
+      - "traefik.http.routers.inocmon-ingestion.tls.certresolver=${TRAEFIK_CERTRESOLVER}"
+      - "traefik.http.services.inocmon-ingestion.loadbalancer.server.port=8443"
+
+      # Redireciona HTTP -> HTTPS
+      - "traefik.http.routers.inocmon-ingestion-http.rule=Host(`${INGESTION_DOMAIN}`)"
+      - "traefik.http.routers.inocmon-ingestion-http.entrypoints=web"
+      - "traefik.http.routers.inocmon-ingestion-http.middlewares=inocmon-redirect-https"
+      - "traefik.http.middlewares.inocmon-redirect-https.redirectscheme.scheme=https"
+
+volumes:
+  pgdata:
+
+networks:
+  inocmon-internal:
+    driver: bridge
+  portainer_default:
+    external: true
