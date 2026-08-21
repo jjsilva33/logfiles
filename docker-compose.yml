@@ -27,6 +27,7 @@ services:
       OAUTH_REDIRECT_URI: https://${INGESTION_DOMAIN}/v1/oauth/callback
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
+    depends_on:
       - postgres
     networks:
       - inocmon-internal
